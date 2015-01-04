@@ -70,6 +70,19 @@ module.exports = (command, callback) ->
 
           # TODO unlink
 
+          if syscall == 'execve'
+            [fname, argv, env] = parse_strace_args args, [
+              argty.STRING
+              argty.ARRAY
+              argty.ARRAY
+            ]
+
+            fname = clean_path fname
+            continue unless fname?
+
+            dependancies.push fname
+
+
           else
             #console.log 'syscall', syscall, args, retval
 
@@ -110,7 +123,10 @@ argty =
   PRIMITIVE: (s) -> s.match(/^([a-zA-Z0-9_$]*)/)
 
   # TODO we don't care about any struct members yet
-  STRUCT: (s) -> s.match(/^{(.*)}/)
+  STRUCT: (s) -> s.match(/^{(.*?)}/)
+
+  # TODO we don't care about any array members yet
+  ARRAY: (s) -> s.match(/^\[(.*?)\]/)
 
   OPTS: (s) ->
     [token, opts] = s.match(/^([a-zA-Z0-9_$|]*)/)
