@@ -1,78 +1,158 @@
 fs = require 'fs'
+path = require 'path'
+
 us = require 'underscore'
+async = require 'async'
+subdir = require 'subdir'
 
-reactive_run = require './reactive_run'
+project_root = process.cwd()
 
-changed_buffer = []
-debounce_block = {}
+## Job management
 
-active_jobs = 0
-is_sleeping = -> active_jobs == 0
+jobs = []
+dependant_jobs = (key) -> jobs.filter (j) -> j.depends_on(key)
+is_produced = (key) -> us.any(jobs.filter (j) -> key in j.products)
 
-deps = {}
+run_job = (job, callback = (->)) ->
+  # get the old products from the last run we may need to clean up
+  oldproducts = job.products
 
-run = (cmd, cont = (->)) ->
-  active_jobs += 1
-
-  console.log cmd
-  reactive_run cmd, (res) ->
-    console.dir res
-    console.log res.stdout if res.stdout
-
-    olddeps = deps[cmd]
-    deps[cmd] = res
-
-    # delete stale files
+  job.rerun ->
     # TODO don't delete files that were intentionally left unchanged
     # TODO don't propagate changes to files which ended up the same
 
-    if olddeps
-      for stale_file in us.difference(olddeps.dependants, res.dependants)
-        console.log 'deleting', file
-        fs.unlink file, ->
-          changed(file)
+    # delete stale files
+    stale_keys = us.difference(oldproducts, job.products)
+    delete_dead_key(stale_key) for stale_key in stale_keys
 
-    for fresh_file in res.dependants
-      propagate_changes(fresh_file)
+    # mark all freshly changed files as dirty to propagate their changes
+    wrote_key(product) for product in job.products
 
-    active_jobs -= 1
-    changed_buffer = us.difference(changed_buffer, res.dependants)
-    cont()
-    check_changed()
+    callback()
 
-propagate_changes = (filename) ->
-  #console.log 'propagate', filename, deps
-  for own cmd, details of deps
-    if filename in details.dependancies
-      run(cmd)
+add_job = (job) ->
+  jobs.push(job)
+  queue_job(job)
+
+## Key management
+
+wrote_key = (key) ->
+  # TODO if key of new file, dirty the file's directory
+  dirty_key(key)
+
+delete_dead_key = (key) ->
+  file = file_for_key(key)
+  #console.log 'deleting:', file
+  fs.unlink file, ->
+    # TODO dirty the directory
+    dirty_key(key)
+
+## File keys
+# for now, all keys are file keys, and they are just relative paths
+# to the root of the project
+
+key_for_file = (file) ->
+  return null unless subdir(project_root, file)
+  return path.relative(project_root, file)
+
+file_for_key = (key) ->
+  # TODO strip fs:/
+  return path.resolve(key)
+
+## Rebuild policy
+# For now, use a stupid policy of only run one job at a time.
+# HACK keeps track of whether a job is in the queue as to not dup entries via
+# job.is_queued, which shouldn't exist.
+
+job_queue = async.queue ((task, callback)-> task(callback)), 1
+
+dirty_key = (key) ->
+  #console.log 'dirty:', key
+  queue_job(job) for job in dependant_jobs(key)
+
+queue_job = (job) ->
+  # if job is already in the queue, don't add it again
+  return if job.is_queued == true
+  job.is_queued = true
+
+  job_queue.push (callback) ->
+    job.is_queued = false
+    run_job job, ->
+      #console.dir {cmd: job.cmd, deps: job.dependancies, prods: job.products}
+      callback()
+
+
+## Bash builder
+reactive_run = require './reactive_run'
+
+class BashBuilder
+  constructor: (@cmd) ->
+    # errors/warnings produced by the command, i.e. parsed stdout + stderr
+    @notes = ''
+
+    # deps/prods get filled in at first run
+    @dependancies = []
+    @products = []
+
+    # @is_good is currently unused
+    # it's unclear what it's inital value should be or represent
+    @is_good = false
+
+  rerun: (callback) ->
+    console.log @cmd
+    reactive_run @cmd, (results) =>
+      #console.dir 'finished', @cmd, results
+      console.log results.stdout if results.stdout
+
+      # translate from file paths to keys
+      # ignore system files outside the project
+      @dependancies = us.compact(results.dependancies.map(key_for_file))
+      @products = us.compact(results.dependants.map(key_for_file))
+
+      #console.dir {cmd: @cmd, thedeps: @dependancies, prods: @products}
+
+      @is_good = results.succeeded
+
+      # TODO standardized, structured format for code annotations (i.e. line
+      # and column numbers for errors)
+      # TODO incorporate stderr
+      @notes = results.stdout
+
+      callback()
+
+  depends_on: (key) ->
+    return key in @dependancies
+
+
+## front end
+
+debounce_block = {}
 
 fs.watch '.', (evt, filename) ->
   # so this is actually pretty sketchy since there's probs
   # no guarentee of ordering
 
+  return if debounce_block[filename]
+  debounce_block[filename] = true
   setTimeout (->
-
-    return if debounce_block[filename]
-    debounce_block[filename] = true
-    setTimeout (-> delete debounce_block[filename]), 100
-
-    changed_buffer.push filename
-    check_changed()
-
+    #console.log 'changed:', filename
+    filekey = key_for_file(path.resolve(filename))
+    dirty_key(filekey) unless is_produced(filekey)
+    delete debounce_block[filename]
   ), 100
 
-check_changed = ->
-  return unless is_sleeping()
-  [changed_files, changed_buffer] = [us.uniq(changed_buffer), []]
 
-  for file in changed_files
-    console.log file
-    propagate_changes(file)
+
+## example buildfile
+
+run = (cmd) ->
+  job = new BashBuilder(cmd)
+  add_job(job)
 
 run 'coffee -c cs.coffee'
 run 'coffee -c cas.coffee'
 
-run 'gcc -c myprog.c', ->
-  run 'gcc -c support.c', ->
-    run 'gcc support.o myprog.o -o myproc', ->
-      run './myproc'
+run 'gcc -c myprog.c'
+run 'gcc -c support.c'
+run 'gcc support.o myprog.o -o myproc'
+run './myproc'
